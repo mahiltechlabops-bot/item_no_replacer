@@ -30,6 +30,10 @@ def init_state():
         # Snapshot of Excel A at the time it was loaded; used for change highlighting.
         "df_a_original": None,
         "df_b": None,
+        "file_a_error": None,
+        "file_b_error": None,
+        "file_a_empty_message": None,
+        "file_b_empty_message": None,
         "history_stack": [],   # list of df_a snapshots (undo)
         "redo_stack": [],
         "change_log": [],      # [{ts, productId, name, old_item, new_item, item_name}]
@@ -64,6 +68,30 @@ def df_to_excel_bytes(df):
         df.to_excel(w, index=False)
     return buf.getvalue()
 
+def read_excel_file(file_obj, label):
+    try:
+        df = pd.read_excel(file_obj)
+    except Exception as exc:
+        return None, f"{label} could not be opened. Please upload a valid Excel file. Details: {exc}"
+
+    df.columns = [str(c).strip() for c in df.columns]
+    return df, None
+
+def save_excel_file(df, out_path):
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        df.to_excel(out_path, index=False, engine="openpyxl")
+    except PermissionError:
+        return (
+            False,
+            "Could not save the Excel file because it is open in another program. "
+            "Close it and try again."
+        )
+    except Exception as exc:
+        return False, f"Could not save the Excel file. Details: {exc}"
+
+    return True, None
+
 def get_modified_product_list():
     current_df = st.session_state.df_a
     original_df = st.session_state.df_a_original
@@ -90,25 +118,72 @@ def get_modified_product_list():
     )
     return current_df.loc[changed_mask].copy()
 
-def merge_with_existing_modified_list(new_df, out_path):
-    if new_df is None or new_df.empty:
-        return pd.DataFrame(columns=new_df.columns if new_df is not None else [])
+def build_change_signature_series(df):
+    if df is None or df.empty:
+        return pd.Series(dtype="string")
 
-    if os.path.exists(out_path):
-        existing_df = pd.read_excel(out_path)
-        merged_df = pd.concat([existing_df, new_df], ignore_index=True, sort=False)
-    else:
-        merged_df = new_df.copy()
-
-    if "productId" in merged_df.columns:
-        merged_df = (
-            merged_df.assign(_pid=merged_df["productId"].astype(str))
-            .drop_duplicates(subset="_pid", keep="last")
-            .drop(columns="_pid")
-            .reset_index(drop=True)
+    if "productId" in df.columns and "item_No" in df.columns:
+        return (
+            df["productId"].fillna("").astype(str).str.strip()
+            + "||"
+            + df["item_No"].fillna("").astype(str).str.strip()
         )
 
-    return merged_df
+    return df.fillna("").astype(str).agg("||".join, axis=1)
+
+def build_product_id_series(df):
+    if df is None or df.empty or "productId" not in df.columns:
+        return pd.Series(dtype="string")
+
+    return df["productId"].fillna("").astype(str).str.strip()
+
+def merge_with_existing_modified_list(new_df, out_path):
+    existing_df = pd.DataFrame(columns=new_df.columns if new_df is not None else [])
+
+    if os.path.exists(out_path):
+        try:
+            existing_df = pd.read_excel(out_path)
+        except Exception as exc:
+            return None, None, (
+                "Could not open the existing modified product list Excel file. "
+                f"Details: {exc}"
+            )
+
+    empty_like_existing = pd.DataFrame(columns=existing_df.columns)
+
+    if new_df is None or new_df.empty:
+        return existing_df.reset_index(drop=True), empty_like_existing.copy(), empty_like_existing.copy(), existing_df.reset_index(drop=True), None
+
+    new_signatures = build_change_signature_series(new_df)
+    existing_signatures = set(build_change_signature_series(existing_df).tolist()) if not existing_df.empty else set()
+    exact_match_mask = new_signatures.isin(existing_signatures)
+
+    existing_product_ids = set(build_product_id_series(existing_df).tolist()) if not existing_df.empty else set()
+    new_product_ids = build_product_id_series(new_df)
+    conflicting_mask = new_product_ids.isin(existing_product_ids) & ~exact_match_mask
+
+    overwrite_df = new_df.loc[conflicting_mask].copy().reset_index(drop=True)
+    append_df = new_df.loc[~exact_match_mask & ~conflicting_mask].copy().reset_index(drop=True)
+
+    append_preview_df = existing_df.copy()
+    if not append_df.empty:
+        append_preview_df = pd.concat([append_preview_df, append_df], ignore_index=True, sort=False)
+
+    overwrite_preview_df = append_preview_df.copy()
+    if not overwrite_df.empty:
+        overwrite_product_ids = set(build_product_id_series(overwrite_df).tolist())
+        if overwrite_product_ids and "productId" in overwrite_preview_df.columns:
+            keep_mask = ~build_product_id_series(overwrite_preview_df).isin(overwrite_product_ids)
+            overwrite_preview_df = overwrite_preview_df.loc[keep_mask].copy()
+        overwrite_preview_df = pd.concat([overwrite_preview_df, overwrite_df], ignore_index=True, sort=False)
+
+    return (
+        append_preview_df.reset_index(drop=True),
+        append_df.reset_index(drop=True),
+        overwrite_df.reset_index(drop=True),
+        overwrite_preview_df.reset_index(drop=True),
+        None,
+    )
 
 def scroll_excel_a_to_selected_row(selected_index):
     if selected_index is None or selected_index < 0:
@@ -290,28 +365,73 @@ col_a, col_b = st.columns(2)
 with col_a:
     file_a = st.file_uploader("Upload Excel A (products)", type=["xlsx", "xls"], key="up_a")
     if file_a:
-        raw = pd.read_excel(file_a)
-        raw.columns = [c.strip() for c in raw.columns]
-        inactive = raw[raw["status"].astype(str).str.lower() == "inactive"].reset_index(drop=True)
-        if st.session_state.df_a is None or file_a.name != st.session_state.file_a_name:
-            st.session_state.df_a = inactive.copy()
-            st.session_state.df_a_original = inactive.copy()
-            st.session_state.file_a_name = file_a.name
-            st.session_state.history_stack.clear()
-            st.session_state.redo_stack.clear()
-            st.session_state.changed_product_ids = []
-        st.success(f"{len(inactive)} inactive records loaded")
+        with st.spinner("Loading Excel A..."):
+            raw, file_a_error = read_excel_file(file_a, "Excel A")
+
+        st.session_state.file_a_error = file_a_error
+        st.session_state.file_a_empty_message = None
+
+        if file_a_error:
+            st.session_state.df_a = None
+            st.session_state.df_a_original = None
+            st.error(file_a_error)
+        elif "status" not in raw.columns:
+            st.session_state.df_a = None
+            st.session_state.df_a_original = None
+            st.session_state.file_a_error = "Excel A is missing the required `status` column."
+            st.error(st.session_state.file_a_error)
+        else:
+            inactive = raw[raw["status"].astype(str).str.lower() == "inactive"].reset_index(drop=True)
+            if st.session_state.df_a is None or file_a.name != st.session_state.file_a_name:
+                st.session_state.df_a = inactive.copy()
+                st.session_state.df_a_original = inactive.copy()
+                st.session_state.file_a_name = file_a.name
+                st.session_state.history_stack.clear()
+                st.session_state.redo_stack.clear()
+                st.session_state.changed_product_ids = []
+
+            if raw.empty:
+                st.session_state.file_a_empty_message = "Excel A is empty."
+                st.warning(st.session_state.file_a_empty_message)
+            elif inactive.empty:
+                st.session_state.file_a_empty_message = "Excel A loaded, but no inactive records were found."
+                st.warning(st.session_state.file_a_empty_message)
+            else:
+                st.success(f"{len(inactive)} inactive records loaded")
 
 with col_b:
     file_b = st.file_uploader("Upload Excel B (item master)", type=["xlsx", "xls"], key="up_b")
     if file_b:
-        df_b = pd.read_excel(file_b)
-        df_b.columns = [c.strip() for c in df_b.columns]
-        st.session_state.df_b = df_b
-        st.success(f"{len(df_b)} records loaded")
+        with st.spinner("Loading Excel B..."):
+            df_b, file_b_error = read_excel_file(file_b, "Excel B")
+
+        st.session_state.file_b_error = file_b_error
+        st.session_state.file_b_empty_message = None
+
+        if file_b_error:
+            st.session_state.df_b = None
+            st.error(file_b_error)
+        else:
+            st.session_state.df_b = df_b
+            if df_b.empty:
+                st.session_state.file_b_empty_message = "Excel B is empty."
+                st.warning(st.session_state.file_b_empty_message)
+            else:
+                st.success(f"{len(df_b)} records loaded")
 
 if st.session_state.df_a is None or st.session_state.df_b is None:
     st.info("Please upload both Excel A and Excel B to get started.")
+    st.stop()
+
+if st.session_state.file_a_error or st.session_state.file_b_error:
+    st.stop()
+
+if st.session_state.df_a.empty:
+    st.info(st.session_state.file_a_empty_message or "Excel A has no rows to display.")
+    st.stop()
+
+if st.session_state.df_b.empty:
+    st.info(st.session_state.file_b_empty_message or "Excel B has no rows to match against.")
     st.stop()
 
 st.divider()
@@ -329,22 +449,50 @@ with tb2:
 with tb3:
     modified_df = get_modified_product_list()
     project_root = os.path.dirname(os.path.abspath(__file__))
-    records_dir = os.path.join(project_root, "Records")
+    records_dir = os.path.join(project_root, "files")
     out_path = os.path.join(records_dir, "modified_product_list.xlsx")
-    save_df = merge_with_existing_modified_list(modified_df, out_path)
-    excel_bytes = df_to_excel_bytes(save_df)
-    # Save only the changed records, appended into the modified product list.
+    save_df, pending_save_df, overwrite_df, overwrite_save_df, save_df_error = merge_with_existing_modified_list(modified_df, out_path)
+    excel_bytes = df_to_excel_bytes(save_df) if save_df_error is None else None
+    # Append only brand-new productIds. Existing productIds require explicit overwrite.
+    if save_df_error:
+        st.error(save_df_error)
+    elif modified_df.empty:
+        st.caption("No modified rows to save yet.")
+    elif pending_save_df.empty and overwrite_df.empty:
+        st.caption("All current modified rows are already appended in the saved file.")
+    elif not overwrite_df.empty:
+        overwrite_ids = ", ".join(overwrite_df["productId"].astype(str).head(5).tolist())
+        if len(overwrite_df) > 5:
+            overwrite_ids += ", ..."
+        st.warning(
+            f"{len(overwrite_df)} row(s) already exist in the saved file by productId. "
+            f"Use Overwrite to replace them. ProductIds: {overwrite_ids}"
+        )
 
-    if st.button("💾 Save", use_container_width=True, disabled=modified_df.empty):
-        os.makedirs(records_dir, exist_ok=True)
-        save_df.to_excel(out_path, index=False, engine="openpyxl")
-        st.success(f"Updated `{os.path.join('Records', 'modified_product_list.xlsx')}`")
+    if st.button("💾 Save", use_container_width=True, disabled=save_df_error is not None or pending_save_df.empty):
+        ok, save_error = save_excel_file(save_df, out_path)
+        if ok:
+            st.success(
+                f"Appended {len(pending_save_df)} row(s) to "
+                f"`{os.path.join('files', 'modified_product_list.xlsx')}`"
+            )
+        else:
+            st.error(save_error)
+    if st.button("Overwrite Existing ProductIds", use_container_width=True, disabled=save_df_error is not None or overwrite_df.empty):
+        ok, save_error = save_excel_file(overwrite_save_df, out_path)
+        if ok:
+            st.success(
+                f"Overwrote {len(overwrite_df)} existing productId row(s) in "
+                f"`{os.path.join('files', 'modified_product_list.xlsx')}`"
+            )
+        else:
+            st.error(save_error)
     st.download_button(
         "Download modified_product_list.xlsx",
         data=excel_bytes,
         file_name="modified_product_list.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        disabled=modified_df.empty,
+        disabled=save_df_error is not None or save_df is None or save_df.empty,
         use_container_width=True,
     )
 with tb4:
