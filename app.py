@@ -68,11 +68,24 @@ def df_to_excel_bytes(df):
         df.to_excel(w, index=False)
     return buf.getvalue()
 
-def read_excel_file(file_obj, label):
+def read_tabular_file(file_obj, label):
+    file_name = (getattr(file_obj, "name", "") or "").lower()
+
     try:
-        df = pd.read_excel(file_obj)
+        if file_name.endswith(".csv"):
+            df = pd.read_csv(file_obj)
+        elif file_name.endswith(".xlsx") or file_name.endswith(".xls"):
+            df = pd.read_excel(file_obj)
+        else:
+            return None, (
+                f"{label} format is not supported. "
+                "Please upload an Excel or CSV file."
+            )
     except Exception as exc:
-        return None, f"{label} could not be opened. Please upload a valid Excel file. Details: {exc}"
+        return None, (
+            f"{label} could not be opened. Please upload a valid Excel or CSV file. "
+            f"Details: {exc}"
+        )
 
     df.columns = [str(c).strip() for c in df.columns]
     return df, None
@@ -363,10 +376,10 @@ st.title("🔄 Item No Replacer")
 # Upload row
 col_a, col_b = st.columns(2)
 with col_a:
-    file_a = st.file_uploader("Upload Excel A (products)", type=["xlsx", "xls"], key="up_a")
+    file_a = st.file_uploader("Upload Excel A (products)", type=["xlsx", "xls", "csv"], key="up_a")
     if file_a:
         with st.spinner("Loading Excel A..."):
-            raw, file_a_error = read_excel_file(file_a, "Excel A")
+            raw, file_a_error = read_tabular_file(file_a, "Excel A")
 
         st.session_state.file_a_error = file_a_error
         st.session_state.file_a_empty_message = None
@@ -400,10 +413,10 @@ with col_a:
                 st.success(f"{len(inactive)} inactive records loaded")
 
 with col_b:
-    file_b = st.file_uploader("Upload Excel B (item master)", type=["xlsx", "xls"], key="up_b")
+    file_b = st.file_uploader("Upload Excel B (item master)", type=["xlsx", "xls", "csv"], key="up_b")
     if file_b:
         with st.spinner("Loading Excel B..."):
-            df_b, file_b_error = read_excel_file(file_b, "Excel B")
+            df_b, file_b_error = read_tabular_file(file_b, "Excel B")
 
         st.session_state.file_b_error = file_b_error
         st.session_state.file_b_empty_message = None

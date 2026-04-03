@@ -1,6 +1,7 @@
 # Item No Replacer
 
 A local Streamlit tool to match and replace item_No values in Excel A using records from Excel B.
+Both uploads support Excel (`.xlsx`, `.xls`) and CSV (`.csv`) files.
 
 ## Setup (one time)
 
@@ -22,8 +23,8 @@ Opens at: http://localhost:8501
 
 ## How to use
 
-1. Upload **Excel A** (your product list — only Inactive records are shown)
-2. Upload **Excel B** (item master)
+1. Upload **Excel A** (Excel or CSV; only Inactive records are shown)
+2. Upload **Excel B** (Excel or CSV item master)
 3. **Check a row** in the Excel A table to select it
 4. Matching items from Excel B appear on the right (filtered by brand + subcategory)
 5. Click **Apply** next to the item you want → item_No is updated
